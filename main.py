@@ -33,6 +33,9 @@ AUTO_STATUS_RUNNING = False
 AUTO_STATUS_MESSAGE_ID = None
 LOG_NEEDS_REPOST = False
 
+# Trạng thái chờ upload file
+UPLOAD_STATE = {}  # {chat_id: True}
+
 def load_accounts():
     with open("accounts.json", "r", encoding="utf-8") as f:
         return json.load(f)
@@ -105,7 +108,7 @@ def get_github_otp_from_imap(gmail_user, gmail_pass, chat_id=None, repo_name="")
         print(f"Lỗi IMAP: {e}")
         return None
     finally:
-        # Đảm bảo đóng kết nối IMAP trong mọi trường hợp
+        # FIX: Đảm bảo đóng kết nối IMAP trong mọi trường hợp
         if mail:
             try:
                 mail.logout()
@@ -168,7 +171,9 @@ def clean_all_active_codespaces(token):
     except Exception as e:
         print(f"Lỗi dọn dẹp: {e}")
 
+# ==================== HÀM HELPER CHỤP ẢNH DEBUG ====================
 def send_debug_screenshot(page, repo_name, chat_id, status_text):
+    """Chụp ảnh màn hình hiện tại và gửi về Telegram, sau đó xóa file."""
     screenshot_path = None
     try:
         timestamp = int(time.time())
@@ -185,12 +190,14 @@ def send_debug_screenshot(page, repo_name, chat_id, status_text):
     except Exception as e:
         print(f"Lỗi chụp ảnh debug cho {repo_name}: {e}")
     finally:
+        # FIX: Đảm bảo xóa file kể cả khi gửi thất bại
         if screenshot_path and os.path.exists(screenshot_path):
             try:
                 os.remove(screenshot_path)
             except:
                 pass
 
+# ==================== LÕI XỬ LÝ HÀNG ĐỢI TẬP TRUNG ====================
 def playwright_queue_processor():
     print("🚀 Đã kích hoạt lõi xử lý hàng đợi tập trung...")
     while True:
@@ -211,6 +218,7 @@ def playwright_queue_processor():
             finally:
                 PLAYWRIGHT_QUEUE.task_done()
         except Exception as e:
+            # FIX: Nếu có lỗi không mong muốn ở ngoài, log và tiếp tục
             print(f"Lỗi nghiêm trọng trong queue processor: {e}")
             time.sleep(1)
 
@@ -220,15 +228,17 @@ def process_account_batch_task(task):
     
     account_otp_lock = threading.Lock()
     repos = acc["repos"]
+    # FIX: Giảm max_workers xuống 2 để phù hợp VPS 2 core
     max_workers = min(len(repos), 2)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
         for index, repo in enumerate(repos):
             future = executor.submit(run_single_bot_pipeline, acc, repo, chat_id, account_otp_lock, index)
             futures.append(future)
+        # FIX: Thêm timeout cho future.result() để tránh treo vô hạn
         for future in futures:
             try:
-                future.result(timeout=600)
+                future.result(timeout=600)  # 10 phút cho mỗi pipeline
             except FutureTimeoutError:
                 print(f"Pipeline timeout, hủy future")
                 future.cancel()
@@ -305,6 +315,7 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                     page.click("input[type='submit']")
                     time.sleep(3)
                     
+                    # Kiểm tra lỗi đăng nhập
                     error_element = page.locator(".flash-error, #js-flash-container .flash-error, div.flash-error")
                     if error_element.count() > 0 and error_element.is_visible():
                         error_text = error_element.inner_text()
@@ -316,6 +327,7 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                             is_locked = False
                         return
                     
+                    # Đợi OTP
                     for _ in range(16):
                         if page.locator("div.workbench, input[id='app_totp'], input[id='otp'], input[name='otp']").first.is_visible(): break
                         time.sleep(0.5)
@@ -324,6 +336,7 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                         STATUS_TRACKER[repo_name]["status"] = "🤖 Đang quét giải mã OTP từ Gmail..."
                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
                         received_code = None
+                        # Tăng số lần thử lên 20 (100 giây) để đảm bảo có đủ thời gian email đến
                         for _ in range(20):
                             received_code = get_github_otp_from_imap(
                                 acc.get("gmail_login", ""), 
@@ -367,6 +380,7 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             
             terminal_ready = False
+            # Tăng số lần thử lên 45 (~180 giây) để thích ứng với môi trường chậm
             for _ in range(45):  
                 time.sleep(4)
                 has_loading = page.locator("text=Setting up remote connection, text=Opening Remote, text=Building codespace").first.is_visible()
@@ -383,6 +397,7 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
             
             time.sleep(3) 
             
+            # Ép mở Terminal mới
             STATUS_TRACKER[repo_name]["status"] = "⌨️ Ép mở Terminal mới để chạy lệnh..."
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             page.keyboard.press("F1")
@@ -469,6 +484,7 @@ def process_login_task(task):
                     page.click("input[type='submit']")
                     time.sleep(3)
                     
+                    # Kiểm tra lỗi đăng nhập
                     error_element = page.locator(".flash-error, #js-flash-container .flash-error, div.flash-error")
                     if error_element.count() > 0 and error_element.is_visible():
                         error_text = error_element.inner_text()
@@ -590,6 +606,7 @@ def process_resetcmd_task(task):
                     
                     page.goto(web_url, timeout=30000, wait_until="commit")
                     
+                    # Tăng timeout cho resetcmd
                     for _ in range(45):
                         time.sleep(4)
                         if not page.locator("text=Setting up remote connection, text=Opening Remote, text=Building codespace").first.is_visible():
@@ -801,6 +818,7 @@ def send_help_menu(message):
         f"⚡ `/resetcmd [Bot1] [Bot2]` : Sạch Terminal tuần tự xếp hàng 100% không lỗi luồng.\n"
         f"📸 `/anh [Tên_Bot]` : Chụp ảnh giao diện không lo sập RAM.\n"
         f"🖥️ `/start` : Xem thông số phần cứng thực tế của VPS.\n"
+        f"📤 `/upload` : Upload file `accounts.json` mới từ Telegram.\n"
         f"⚠️ Lệnh /startall hỗ trợ chọn lọc bot tùy biến mà vẫn bảo lưu khóa OTP theo cụm tài khoản."
     )
     bot.reply_to(message, help_text, parse_mode="Markdown")
@@ -891,6 +909,7 @@ def start_all(message):
 
 def send_auto_status(chat_id):
     global AUTO_STATUS_MESSAGE_ID, AUTO_STATUS_RUNNING, LOG_NEEDS_REPOST
+    # FIX: Tăng thời gian sleep lên 10 giây để giảm tải Telegram API
     while AUTO_STATUS_RUNNING:
         now_str = get_vietnam_time()
         cpu_usage, ram_usage, ram_used_gb, ram_total_gb = get_hardware_status()
@@ -925,7 +944,7 @@ def send_auto_status(chat_id):
         except: 
             pass
             
-        time.sleep(10)
+        time.sleep(10)  # FIX: Tăng lên 10 giây
 
 @bot.message_handler(commands=['stopall'])
 def stop_all(message):
@@ -939,8 +958,81 @@ def stop_all(message):
     ACTIVE_BROWSERS.clear()
     bot.send_message(message.chat.id, f"🎯 Đã dừng toàn bộ hệ thống.")
 
+# ==================== LỆNH UPLOAD FILE ACCOUNTS.JSON ====================
+@bot.message_handler(commands=['upload'])
+def upload_accounts_command(message):
+    """Bắt đầu quy trình upload file accounts.json mới."""
+    if not is_admin(message):
+        bot.reply_to(message, "⛔ Bạn không có quyền sử dụng lệnh này.")
+        return
+    chat_id = message.chat.id
+    UPLOAD_STATE[chat_id] = True
+    bot.reply_to(message, "📤 Vui lòng gửi file `accounts.json` (dưới dạng tài liệu) để cập nhật.\n"
+                          "Bot sẽ kiểm tra, lưu và áp dụng file mới ngay lập tức.\n"
+                          "Nếu muốn hủy, hãy gửi lệnh `/cancel_upload`.")
+
+@bot.message_handler(commands=['cancel_upload'])
+def cancel_upload(message):
+    """Hủy trạng thái chờ upload file."""
+    if not is_admin(message):
+        return
+    chat_id = message.chat.id
+    if chat_id in UPLOAD_STATE:
+        del UPLOAD_STATE[chat_id]
+        bot.reply_to(message, "❌ Đã hủy quá trình upload file.")
+    else:
+        bot.reply_to(message, "ℹ️ Bạn chưa có tiến trình upload nào đang chờ.")
+
+@bot.message_handler(content_types=['document'])
+def handle_uploaded_file(message):
+    """Xử lý file được gửi đến khi đang chờ upload."""
+    if not is_admin(message):
+        return
+    chat_id = message.chat.id
+    if chat_id not in UPLOAD_STATE:
+        return  # Không phải trạng thái upload
+
+    document = message.document
+    if not document:
+        bot.reply_to(message, "❌ Vui lòng gửi file dưới dạng tài liệu (document).")
+        return
+
+    file_name = document.file_name if document.file_name else ""
+    if not file_name.lower().endswith(".json"):
+        bot.reply_to(message, "❌ Chỉ chấp nhận file có đuôi `.json`. Bạn đã gửi file: `{}`".format(file_name), parse_mode="Markdown")
+        return
+
+    # Tải file xuống
+    try:
+        file_info = bot.get_file(document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        content = downloaded_file.decode('utf-8')
+    except Exception as e:
+        bot.reply_to(message, f"❌ Lỗi khi tải file: {str(e)[:100]}")
+        return
+
+    # Kiểm tra JSON hợp lệ
+    try:
+        json_data = json.loads(content)
+    except json.JSONDecodeError as e:
+        bot.reply_to(message, f"❌ File JSON không hợp lệ: {str(e)}")
+        return
+
+    # Lưu file mới
+    try:
+        with open("accounts.json", "w", encoding="utf-8") as f:
+            json.dump(json_data, f, indent=2, ensure_ascii=False)
+        bot.reply_to(message, "✅ Đã lưu file `accounts.json` thành công. Bot sẽ sử dụng cấu hình mới ngay lập tức.")
+        # Xóa trạng thái chờ
+        if chat_id in UPLOAD_STATE:
+            del UPLOAD_STATE[chat_id]
+        # (Tùy chọn) Reload accounts để kiểm tra lỗi ngay, nhưng không bắt buộc vì load_accounts() sẽ được gọi khi cần.
+    except Exception as e:
+        bot.reply_to(message, f"❌ Lỗi khi lưu file: {str(e)[:100]}")
+
 if __name__ == "__main__":
     Thread(target=playwright_queue_processor, daemon=True).start()
+    # FIX: Bọc infinity_polling trong vòng lặp restart để tự động phục hồi
     while True:
         try:
             bot.infinity_polling()
