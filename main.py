@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 # ==================== CẤU HÌNH HỆ THỐNG ====================
-TOKEN = "8744525541:AAFNemNTHe_vveDQGSygwWcLRgxwd7rsTjM"
+TOKEN = "7990637056:AAFm5RzSQokBVLQdlgnAE6ILqNYFTrl8CyU"
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "7497594902,1234567890")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()]
 
