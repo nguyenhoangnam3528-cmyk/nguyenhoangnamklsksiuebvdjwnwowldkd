@@ -34,7 +34,7 @@ AUTO_STATUS_MESSAGE_ID = None
 LOG_NEEDS_REPOST = False
 
 # Trạng thái chờ upload file
-UPLOAD_STATE = {}  # {chat_id: True}
+UPLOAD_STATE = {}
 
 def load_accounts():
     with open("accounts.json", "r", encoding="utf-8") as f:
@@ -65,7 +65,6 @@ def get_github_otp_from_imap(gmail_user, gmail_pass, chat_id=None, repo_name="")
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(gmail_user, gmail_pass)
-        # Thử cả Inbox và Spam
         for folder in ["inbox", "[Gmail]/Spam"]:
             try:
                 mail.select(folder)
@@ -75,7 +74,6 @@ def get_github_otp_from_imap(gmail_user, gmail_pass, chat_id=None, repo_name="")
                 mail_ids = data[0].split()
                 if not mail_ids:
                     continue
-                # Duyệt từ mới nhất đến cũ, tối đa 10 email
                 for m_id in reversed(mail_ids[-10:]):
                     status, msg_data = mail.fetch(m_id, "(RFC822)")
                     if status != "OK":
@@ -108,7 +106,6 @@ def get_github_otp_from_imap(gmail_user, gmail_pass, chat_id=None, repo_name="")
         print(f"Lỗi IMAP: {e}")
         return None
     finally:
-        # FIX: Đảm bảo đóng kết nối IMAP trong mọi trường hợp
         if mail:
             try:
                 mail.logout()
@@ -137,19 +134,15 @@ def create_codespace_via_api(token, repo_url, max_retries=3):
                     if start_res.status_code in [200, 202]:
                         return cs["web_url"]
                     else:
-                        # Nếu start thất bại, thử tạo mới
                         pass
-                # Không có codespace hoặc start thất bại -> tạo mới
                 payload = {"machine": "standardLinux32gb"}
                 create_res = requests.post(api_url, headers=headers, json=payload, timeout=15)
                 if create_res.status_code in [201, 202]:
                     return create_res.json().get("web_url")
-            # Nếu status code không 200, hoặc không có web_url, tiếp tục retry
         except Exception as e:
             print(f"Lỗi API GitHub (lần {attempt}): {e}")
-        # Đợi trước khi retry (backoff)
         if attempt < max_retries:
-            time.sleep(2 ** attempt)  # 2, 4, 8 giây
+            time.sleep(2 ** attempt)
     return None
 
 def clean_all_active_codespaces(token):
@@ -171,6 +164,69 @@ def clean_all_active_codespaces(token):
     except Exception as e:
         print(f"Lỗi dọn dẹp: {e}")
 
+# ==================== HÀM HELPER XỬ LÝ RELOAD CODESPACE ====================
+def handle_codespace_reload(page):
+    """Kiểm tra và bấm nút Reload nếu Codespace mất kết nối. Trả về True nếu đã reload."""
+    reload_clicked = False
+    try:
+        reload_selectors = [
+            "button:has-text('Reload')",
+            "a:has-text('Reload')",
+            "button:text('Reload')",
+            "[role='button']:has-text('Reload')"
+        ]
+        for selector in reload_selectors:
+            try:
+                locator = page.locator(selector).first
+                if locator.is_visible(timeout=1000):
+                    locator.click(timeout=3000)
+                    reload_clicked = True
+                    print("🔄 Đã bấm nút Reload Codespace.")
+                    time.sleep(5)
+                    break
+            except Exception:
+                continue
+        if not reload_clicked:
+            try:
+                disconnected = page.locator("text=Disconnected from Codespaces").first
+                if disconnected.is_visible(timeout=1000):
+                    page.keyboard.press("Enter")
+                    reload_clicked = True
+                    print("🔄 Đã nhấn Enter để reload Codespace.")
+                    time.sleep(5)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Lỗi khi xử lý reload: {e}")
+    return reload_clicked
+
+def wait_for_terminal_with_reload(page, repo_name, chat_id, max_iterations=45, sleep_interval=4):
+    """Vòng lặp chờ Terminal, tự động xử lý reload khi mất kết nối. Trả về True nếu terminal sẵn sàng."""
+    terminal_ready = False
+    reload_attempts = 0
+    max_reload_attempts = 5
+    for _ in range(max_iterations):
+        time.sleep(sleep_interval)
+        try:
+            has_loading = page.locator("text=Setting up remote connection, text=Opening Remote, text=Building codespace").first.is_visible()
+            has_terminal = page.locator(".terminal, .xterm, .integrated-terminal-panel").first.is_visible()
+            if not has_loading and has_terminal:
+                terminal_ready = True
+                break
+            if reload_attempts < max_reload_attempts:
+                if handle_codespace_reload(page):
+                    reload_attempts += 1
+                    print(f"🔄 Đã reload lần {reload_attempts} cho {repo_name}")
+        except Exception as e:
+            print(f"Lỗi trong wait_for_terminal cho {repo_name}: {e}")
+            if reload_attempts < max_reload_attempts:
+                try:
+                    handle_codespace_reload(page)
+                    reload_attempts += 1
+                except:
+                    pass
+    return terminal_ready
+
 # ==================== HÀM HELPER CHỤP ẢNH DEBUG ====================
 def send_debug_screenshot(page, repo_name, chat_id, status_text):
     """Chụp ảnh màn hình hiện tại và gửi về Telegram, sau đó xóa file."""
@@ -190,7 +246,6 @@ def send_debug_screenshot(page, repo_name, chat_id, status_text):
     except Exception as e:
         print(f"Lỗi chụp ảnh debug cho {repo_name}: {e}")
     finally:
-        # FIX: Đảm bảo xóa file kể cả khi gửi thất bại
         if screenshot_path and os.path.exists(screenshot_path):
             try:
                 os.remove(screenshot_path)
@@ -218,7 +273,6 @@ def playwright_queue_processor():
             finally:
                 PLAYWRIGHT_QUEUE.task_done()
         except Exception as e:
-            # FIX: Nếu có lỗi không mong muốn ở ngoài, log và tiếp tục
             print(f"Lỗi nghiêm trọng trong queue processor: {e}")
             time.sleep(1)
 
@@ -228,17 +282,15 @@ def process_account_batch_task(task):
     
     account_otp_lock = threading.Lock()
     repos = acc["repos"]
-    # FIX: Giảm max_workers xuống 2 để phù hợp VPS 2 core
     max_workers = min(len(repos), 2)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
         for index, repo in enumerate(repos):
             future = executor.submit(run_single_bot_pipeline, acc, repo, chat_id, account_otp_lock, index)
             futures.append(future)
-        # FIX: Thêm timeout cho future.result() để tránh treo vô hạn
         for future in futures:
             try:
-                future.result(timeout=600)  # 10 phút cho mỗi pipeline
+                future.result(timeout=600)
             except FutureTimeoutError:
                 print(f"Pipeline timeout, hủy future")
                 future.cancel()
@@ -280,7 +332,6 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
             
             page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
             
-            # ===== GIAI ĐOẠN 1: ĐĂNG NHẬP & OTP =====
             if otp_lock:
                 otp_lock.acquire()
                 is_locked = True
@@ -315,7 +366,6 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                     page.click("input[type='submit']")
                     time.sleep(3)
                     
-                    # Kiểm tra lỗi đăng nhập
                     error_element = page.locator(".flash-error, #js-flash-container .flash-error, div.flash-error")
                     if error_element.count() > 0 and error_element.is_visible():
                         error_text = error_element.inner_text()
@@ -327,7 +377,6 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                             is_locked = False
                         return
                     
-                    # Đợi OTP
                     for _ in range(16):
                         if page.locator("div.workbench, input[id='app_totp'], input[id='otp'], input[name='otp']").first.is_visible(): break
                         time.sleep(0.5)
@@ -336,7 +385,6 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                         STATUS_TRACKER[repo_name]["status"] = "🤖 Đang quét giải mã OTP từ Gmail..."
                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
                         received_code = None
-                        # Tăng số lần thử lên 20 (100 giây) để đảm bảo có đủ thời gian email đến
                         for _ in range(20):
                             received_code = get_github_otp_from_imap(
                                 acc.get("gmail_login", ""), 
@@ -375,19 +423,10 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                 otp_lock.release()
                 is_locked = False
 
-            # ===== GIAI ĐOẠN 2: CHỜ TERMINAL =====
             STATUS_TRACKER[repo_name]["status"] = "⏳ Đang đợi Codespace nạp Terminal..."
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             
-            terminal_ready = False
-            # Tăng số lần thử lên 45 (~180 giây) để thích ứng với môi trường chậm
-            for _ in range(45):  
-                time.sleep(4)
-                has_loading = page.locator("text=Setting up remote connection, text=Opening Remote, text=Building codespace").first.is_visible()
-                has_terminal = page.locator(".terminal, .xterm, .integrated-terminal-panel").first.is_visible()
-                if not has_loading and has_terminal:
-                    terminal_ready = True
-                    break
+            terminal_ready = wait_for_terminal_with_reload(page, repo_name, chat_id, max_iterations=45, sleep_interval=4)
             
             if not terminal_ready:
                 STATUS_TRACKER[repo_name]["status"] = "Offline: Quá thời gian nạp Terminal (GitHub Treo) ❌"
@@ -397,7 +436,6 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
             
             time.sleep(3) 
             
-            # Ép mở Terminal mới
             STATUS_TRACKER[repo_name]["status"] = "⌨️ Ép mở Terminal mới để chạy lệnh..."
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             page.keyboard.press("F1")
@@ -484,7 +522,6 @@ def process_login_task(task):
                     page.click("input[type='submit']")
                     time.sleep(3)
                     
-                    # Kiểm tra lỗi đăng nhập
                     error_element = page.locator(".flash-error, #js-flash-container .flash-error, div.flash-error")
                     if error_element.count() > 0 and error_element.is_visible():
                         error_text = error_element.inner_text()
@@ -528,14 +565,7 @@ def process_login_task(task):
             STATUS_TRACKER[repo_name]["status"] = "⏳ Đang đợi Codespace nạp Terminal..."
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             
-            terminal_ready = False
-            for _ in range(45):
-                time.sleep(4)
-                has_loading = page.locator("text=Setting up remote connection, text=Opening Remote, text=Building codespace").first.is_visible()
-                has_terminal = page.locator(".terminal, .xterm, .integrated-terminal-panel").first.is_visible()
-                if not has_loading and has_terminal:
-                    terminal_ready = True
-                    break
+            terminal_ready = wait_for_terminal_with_reload(page, repo_name, chat_id, max_iterations=45, sleep_interval=4)
             
             if not terminal_ready:
                 STATUS_TRACKER[repo_name]["status"] = "Offline: Quá thời gian nạp Terminal (GitHub Treo) ❌"
@@ -606,11 +636,15 @@ def process_resetcmd_task(task):
                     
                     page.goto(web_url, timeout=30000, wait_until="commit")
                     
-                    # Tăng timeout cho resetcmd
-                    for _ in range(45):
-                        time.sleep(4)
-                        if not page.locator("text=Setting up remote connection, text=Opening Remote, text=Building codespace").first.is_visible():
-                            break
+                    terminal_ready = wait_for_terminal_with_reload(page, target_repo, chat_id, max_iterations=45, sleep_interval=4)
+                    
+                    if not terminal_ready:
+                        STATUS_TRACKER[target_repo]["status"] = "Offline: Quá thời gian nạp Terminal ❌"
+                        STATUS_TRACKER[target_repo]["last_update"] = time.time()
+                        bot.send_message(chat_id, f"❌ Timeout Terminal khi reset `{target_repo.upper()}`")
+                        LOG_NEEDS_REPOST = True
+                        return
+                    
                     time.sleep(5)
                     
                     page.keyboard.press("F1")
@@ -672,6 +706,8 @@ def process_screenshot_task(task):
                     page = context.new_page()
                     page.goto(web_url, timeout=30000, wait_until="commit")
                     time.sleep(15)
+                    handle_codespace_reload(page)
+                    time.sleep(3)
                     temp_shot = f"live_{target_repo}.png"
                     page.screenshot(path=temp_shot)
                     if os.path.exists(temp_shot):
@@ -909,7 +945,6 @@ def start_all(message):
 
 def send_auto_status(chat_id):
     global AUTO_STATUS_MESSAGE_ID, AUTO_STATUS_RUNNING, LOG_NEEDS_REPOST
-    # FIX: Tăng thời gian sleep lên 10 giây để giảm tải Telegram API
     while AUTO_STATUS_RUNNING:
         now_str = get_vietnam_time()
         cpu_usage, ram_usage, ram_used_gb, ram_total_gb = get_hardware_status()
@@ -944,7 +979,7 @@ def send_auto_status(chat_id):
         except: 
             pass
             
-        time.sleep(10)  # FIX: Tăng lên 10 giây
+        time.sleep(10)
 
 @bot.message_handler(commands=['stopall'])
 def stop_all(message):
@@ -990,7 +1025,7 @@ def handle_uploaded_file(message):
         return
     chat_id = message.chat.id
     if chat_id not in UPLOAD_STATE:
-        return  # Không phải trạng thái upload
+        return
 
     document = message.document
     if not document:
@@ -1002,7 +1037,6 @@ def handle_uploaded_file(message):
         bot.reply_to(message, "❌ Chỉ chấp nhận file có đuôi `.json`. Bạn đã gửi file: `{}`".format(file_name), parse_mode="Markdown")
         return
 
-    # Tải file xuống
     try:
         file_info = bot.get_file(document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
@@ -1011,28 +1045,23 @@ def handle_uploaded_file(message):
         bot.reply_to(message, f"❌ Lỗi khi tải file: {str(e)[:100]}")
         return
 
-    # Kiểm tra JSON hợp lệ
     try:
         json_data = json.loads(content)
     except json.JSONDecodeError as e:
         bot.reply_to(message, f"❌ File JSON không hợp lệ: {str(e)}")
         return
 
-    # Lưu file mới
     try:
         with open("accounts.json", "w", encoding="utf-8") as f:
             json.dump(json_data, f, indent=2, ensure_ascii=False)
         bot.reply_to(message, "✅ Đã lưu file `accounts.json` thành công. Bot sẽ sử dụng cấu hình mới ngay lập tức.")
-        # Xóa trạng thái chờ
         if chat_id in UPLOAD_STATE:
             del UPLOAD_STATE[chat_id]
-        # (Tùy chọn) Reload accounts để kiểm tra lỗi ngay, nhưng không bắt buộc vì load_accounts() sẽ được gọi khi cần.
     except Exception as e:
         bot.reply_to(message, f"❌ Lỗi khi lưu file: {str(e)[:100]}")
 
 if __name__ == "__main__":
     Thread(target=playwright_queue_processor, daemon=True).start()
-    # FIX: Bọc infinity_polling trong vòng lặp restart để tự động phục hồi
     while True:
         try:
             bot.infinity_polling()
