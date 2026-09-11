@@ -145,24 +145,121 @@ def create_codespace_via_api(token, repo_url, max_retries=3):
             time.sleep(2 ** attempt)
     return None
 
-def clean_all_active_codespaces(token):
-    api_url = "https://api.github.com/user/codespaces"
+# ====================================================================
+# [DEPRECATED - ĐÃ COMMENT OUT]
+# Hàm clean_all_active_codespaces trước đây được gọi trong start_all:
+#   - GET /user/codespaces → POST stop cho codespace state == "active"
+# Lý do comment out:
+#   - KHÔNG chờ codespace shutdown xong (GitHub API trả 202 ngay,
+#     quá trình shutdown thực tế mất 2-5 giây)
+#   - Filter state quá hẹp (chỉ "active", bỏ qua "starting", "available")
+#   - start_all gọi hàm này chạy ngầm rồi sleep 2s → không kịp stop
+#   - Kết quả: codespace không thực sự stop → tài nguyên không hồi
+# Thay thế bằng: stop_target_repos_codespaces(token, repo_urls) — hàm mới
+#   có chờ (poll) và filter state đúng.
+# ====================================================================
+# def clean_all_active_codespaces(token):
+#     api_url = "https://api.github.com/user/codespaces"
+#     headers = {
+#         "Authorization": f"Bearer {token}",
+#         "Accept": "application/vnd.github+json",
+#         "X-GitHub-Api-Version": "2022-11-28"
+#     }
+#     try:
+#         res = requests.get(api_url, headers=headers, timeout=15)
+#         if res.status_code == 200:
+#             codespaces = res.json().get("codespaces", [])
+#             for cs in codespaces:
+#                 if str(cs.get("state", "")).lower() == "active":
+#                     cs_name = cs["name"]
+#                     stop_url = f"https://api.github.com/user/codespaces/{cs_name}/stop"
+#                     requests.post(stop_url, headers=headers, timeout=15)
+#     except Exception as e:
+#         print(f"Lỗi dọn dẹp: {e}")
+
+def stop_target_repos_codespaces(token, repo_urls, chat_id=None):
+    """Stop codespaces của các repo được chỉ định qua API GitHub.
+    - Với mỗi repo_url: GET /repos/{owner}/{repo}/codespaces
+    - POST stop cho mọi codespace có state != shutdown
+    - Poll tối đa 15 giây, mỗi 2 giây để kiểm tra đã shutdown hết chưa
+    Trả về True nếu tất cả codespace đã shutdown, False nếu timeout."""
+    if not repo_urls:
+        return True
+    
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    try:
-        res = requests.get(api_url, headers=headers, timeout=15)
-        if res.status_code == 200:
-            codespaces = res.json().get("codespaces", [])
-            for cs in codespaces:
-                if str(cs.get("state", "")).lower() == "active":
-                    cs_name = cs["name"]
-                    stop_url = f"https://api.github.com/user/codespaces/{cs_name}/stop"
-                    requests.post(stop_url, headers=headers, timeout=15)
-    except Exception as e:
-        print(f"Lỗi dọn dẹp: {e}")
+    
+    # Bước 1: Gửi stop cho tất cả codespace của từng repo
+    all_cs_names = []
+    for repo_url in repo_urls:
+        repo_path = repo_url.replace("https://github.com/", "").strip("/")
+        try:
+            res = requests.get(
+                f"https://api.github.com/repos/{repo_path}/codespaces",
+                headers=headers, timeout=15
+            )
+            if res.status_code == 200:
+                codespaces = res.json().get("codespaces", [])
+                for cs in codespaces:
+                    state = str(cs.get("state", "")).lower()
+                    if state not in ["shutdown", "shutting_down"]:
+                        cs_name = cs["name"]
+                        stop_url = f"https://api.github.com/user/codespaces/{cs_name}/stop"
+                        try:
+                            requests.post(stop_url, headers=headers, timeout=15)
+                            all_cs_names.append(cs_name)
+                            print(f"🛑 Đã gửi stop cho codespace {cs_name}")
+                        except Exception as e:
+                            print(f"Lỗi stop {cs_name}: {e}")
+        except Exception as e:
+            print(f"Lỗi GET codespaces cho {repo_path}: {e}")
+    
+    if not all_cs_names:
+        print("ℹ️ Không có codespace nào cần stop (đã shutdown sẵn).")
+        return True
+    
+    # Bước 2: Poll đến khi tất cả shutdown (max 15s, mỗi 2s)
+    print(f"⏳ Đang chờ {len(all_cs_names)} codespace shutdown (tối đa 15s)...")
+    
+    max_wait = 15
+    poll_interval = 2
+    elapsed = 0
+    
+    while elapsed < max_wait:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        
+        all_shutdown = True
+        for repo_url in repo_urls:
+            repo_path = repo_url.replace("https://github.com/", "").strip("/")
+            try:
+                res = requests.get(
+                    f"https://api.github.com/repos/{repo_path}/codespaces",
+                    headers=headers, timeout=15
+                )
+                if res.status_code == 200:
+                    codespaces = res.json().get("codespaces", [])
+                    for cs in codespaces:
+                        state = str(cs.get("state", "")).lower()
+                        if state != "shutdown":
+                            all_shutdown = False
+                            break
+                    if not all_shutdown:
+                        break
+            except Exception as e:
+                print(f"Lỗi poll {repo_path}: {e}")
+                all_shutdown = False
+                break
+        
+        if all_shutdown:
+            print(f"✅ Tất cả codespace đã shutdown sau {elapsed}s.")
+            return True
+    
+    print(f"⚠️ Timeout sau {max_wait}s, một số codespace có thể chưa shutdown hẳn.")
+    return False
 
 # ==================== HÀM HELPER XỬ LÝ RELOAD CODESPACE ====================
 def handle_codespace_reload(page):
@@ -262,8 +359,16 @@ def playwright_queue_processor():
             try:
                 if task_type == "account_batch":
                     process_account_batch_task(task)
-                elif task_type == "login":
-                    process_login_task(task)
+                # ====================================================================
+                # [DEPRECATED - ĐÃ COMMENT OUT nhánh "login"]
+                # Nhánh này trước đây xử lý task type "login" bằng cách gọi
+                # process_login_task(task) — hàm này đã bị comment out do
+                # reset_multiple_bots chuyển sang dùng task "account_batch" (3 phase).
+                # Nếu cần khôi phục: bỏ comment 2 dòng dưới và bỏ comment hàm
+                # process_login_task ở phía dưới.
+                # ====================================================================
+                # elif task_type == "login":
+                #     process_login_task(task)
                 elif task_type == "resetcmd":
                     process_resetcmd_task(task)
                 elif task_type == "screenshot":
@@ -279,52 +384,96 @@ def playwright_queue_processor():
 def process_account_batch_task(task):
     acc = task["acc"]
     chat_id = task["chat_id"]
+    repos = task.get("repos", acc["repos"])
+    mode = task.get("mode", "startall")
+    
+    print(f"📥 Bắt đầu account_batch (mode={mode}) với {len(repos)} repo cho account {acc['account_id']}")
     
     account_otp_lock = threading.Lock()
-    repos = acc["repos"]
     max_workers = min(len(repos), 2)
+    
+    # ==================== PHASE 1: LOGIN SONG SONG ====================
+    print(f"🔐 PHASE 1: Login song song cho {len(repos)} repo...")
+    login_results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
+        futures = {}
         for index, repo in enumerate(repos):
-            future = executor.submit(run_single_bot_pipeline, acc, repo, chat_id, account_otp_lock, index)
+            future = executor.submit(login_only_pipeline, acc, repo, chat_id, account_otp_lock, index)
+            futures[future] = repo
+        for future in futures:
+            repo = futures[future]
+            try:
+                result = future.result(timeout=600)
+                login_results[repo["name"]] = bool(result)
+                print(f"  → {repo['name']}: login={'OK' if result else 'FAIL'}")
+            except FutureTimeoutError:
+                print(f"  → {repo['name']}: login TIMEOUT, hủy future")
+                login_results[repo["name"]] = False
+                future.cancel()
+            except Exception as e:
+                print(f"  → {repo['name']}: login EXCEPTION {e}")
+                login_results[repo["name"]] = False
+    
+    success_repos = [r for r in repos if login_results.get(r["name"], False)]
+    if not success_repos:
+        print("❌ Không có repo nào login thành công. Bỏ qua Phase 2 và 3.")
+        return
+    
+    # ==================== PHASE 2: STOP CODESPACE QUA API ====================
+    print(f"🛑 PHASE 2: Stop codespace cho {len(success_repos)} repo đã login thành công...")
+    repo_urls_to_stop = [r["url"] for r in success_repos]
+    stop_target_repos_codespaces(acc["github_token"], repo_urls_to_stop, chat_id)
+    
+    # ==================== PHASE 3: START CODESPACE MỚI ====================
+    print(f"🚀 PHASE 3: Start codespace mới cho {len(success_repos)} repo...")
+    with ThreadPoolExecutor(max_workers=min(len(success_repos), 2)) as executor:
+        futures = []
+        for index, repo in enumerate(success_repos):
+            future = executor.submit(start_new_codespace_pipeline, acc, repo, chat_id, index, account_otp_lock)
             futures.append(future)
         for future in futures:
             try:
                 future.result(timeout=600)
             except FutureTimeoutError:
-                print(f"Pipeline timeout, hủy future")
+                print(f"Phase 3 timeout, hủy future")
                 future.cancel()
             except Exception as e:
-                print(f"Pipeline thất bại: {e}")
+                print(f"Phase 3 thất bại: {e}")
+    
+    print(f"✅ Hoàn tất account_batch (mode={mode}) cho account {acc['account_id']}")
 
-def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
+def login_only_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
+    """PHASE 1: Chỉ login vào GitHub, không chờ terminal, không mở terminal mới.
+    Trả về True nếu login thành công, False nếu fail.
+    Cookie được lưu vào browser_profiles để Phase 3 dùng lại."""
     global LOG_NEEDS_REPOST
     repo_name = repo["name"]
     
     if bot_index > 0:
         delay_time = bot_index * 25
-        STATUS_TRACKER[repo_name]["status"] = f"💤 Giãn cách pha (Chờ {delay_time}s hạ nhiệt CPU)..."
+        STATUS_TRACKER[repo_name]["status"] = f"💤 Phase 1: Giãn cách (Chờ {delay_time}s)..."
         STATUS_TRACKER[repo_name]["last_update"] = time.time()
         time.sleep(delay_time)
     
-    STATUS_TRACKER[repo_name]["status"] = "Đang điều phối API... 🚀"
+    STATUS_TRACKER[repo_name]["status"] = "🔐 Phase 1: Đang chuẩn bị login..."
     STATUS_TRACKER[repo_name]["last_update"] = time.time()
     
     web_url = create_codespace_via_api(acc["github_token"], repo["url"])
     if not web_url:
-        STATUS_TRACKER[repo_name]["status"] = "Thất bại: Lỗi API GitHub ❌"
-        return
-
+        STATUS_TRACKER[repo_name]["status"] = "❌ Phase 1: Lỗi API GitHub (không lấy được URL)"
+        STATUS_TRACKER[repo_name]["last_update"] = time.time()
+        return False
+    
     with sync_playwright() as p:
         context = None
         is_locked = False
         try:
-            STATUS_TRACKER[repo_name]["status"] = "Khởi động lõi ảo cấu hình... 🌐"
+            STATUS_TRACKER[repo_name]["status"] = "Phase 1: Khởi động trình duyệt..."
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             ram_optimize_args = [
-                "--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu",                  
-                "--disable-dev-shm-usage", "--js-flags=--max-old-space-size=100", 
-                "--disable-extensions", "--mute-audio"                     
+                "--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu",
+                "--disable-dev-shm-usage", "--js-flags=--max-old-space-size=100",
+                "--disable-extensions", "--mute-audio"
             ]
             user_data_dir = f"./browser_profiles/{repo_name}"
             context = p.chromium.launch_persistent_context(user_data_dir, headless=True, args=ram_optimize_args)
@@ -335,30 +484,172 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
             if otp_lock:
                 otp_lock.acquire()
                 is_locked = True
-                
-            STATUS_TRACKER[repo_name]["status"] = "Đang tải trang kết nối... ⏳"
+            
+            STATUS_TRACKER[repo_name]["status"] = "Phase 1: Đang tải trang..."
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             page.goto(web_url, timeout=30000, wait_until="commit")
             
             for _ in range(16):
                 if page.locator("div.workbench, div#monaco-parts-splash, .monaco-workbench, input[name='login']").first.is_visible(): break
                 time.sleep(0.5)
-                
+            
             is_workspace = page.locator("div.workbench, div#monaco-parts-splash, .monaco-workbench").is_visible()
             if not is_workspace:
                 if page.locator("input[name='login']").is_visible() or "login" in page.url.lower():
-                    STATUS_TRACKER[repo_name]["status"] = "Nạp thông tin bảo mật... 🔐"
+                    STATUS_TRACKER[repo_name]["status"] = "Phase 1: Đang đăng nhập..."
                     STATUS_TRACKER[repo_name]["last_update"] = time.time()
                     
                     username = acc.get("account_id", "").strip()
                     password = acc.get("github_password", "").strip()
                     if not username or not password:
-                        STATUS_TRACKER[repo_name]["status"] = "Offline: Thiếu username hoặc password ❌"
+                        STATUS_TRACKER[repo_name]["status"] = "❌ Phase 1: Thiếu username/password"
                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                        send_debug_screenshot(page, repo_name, chat_id, "Thiếu username/password trong accounts.json")
+                        send_debug_screenshot(page, repo_name, chat_id, "Phase 1: Thiếu username/password")
                         if is_locked:
                             otp_lock.release()
                             is_locked = False
+                        return False
+                    
+                    page.fill("input[name='login']", username)
+                    page.fill("input[name='password']", password)
+                    page.click("input[type='submit']")
+                    time.sleep(3)
+                    
+                    error_element = page.locator(".flash-error, #js-flash-container .flash-error, div.flash-error")
+                    if error_element.count() > 0 and error_element.is_visible():
+                        error_text = error_element.inner_text()
+                        STATUS_TRACKER[repo_name]["status"] = "❌ Phase 1: Đăng nhập thất bại"
+                        STATUS_TRACKER[repo_name]["last_update"] = time.time()
+                        send_debug_screenshot(page, repo_name, chat_id, f"Phase 1 login lỗi: {error_text[:100]}")
+                        if is_locked:
+                            otp_lock.release()
+                            is_locked = False
+                        return False
+                    
+                    for _ in range(16):
+                        if page.locator("div.workbench, input[id='app_totp'], input[id='otp'], input[name='otp']").first.is_visible(): break
+                        time.sleep(0.5)
+                    
+                    if page.locator("input[id='app_totp'], input[id='otp'], input[name='otp'], input[id='verification_code']").first.is_visible():
+                        STATUS_TRACKER[repo_name]["status"] = "Phase 1: Đang quét OTP từ Gmail..."
+                        STATUS_TRACKER[repo_name]["last_update"] = time.time()
+                        received_code = None
+                        for _ in range(20):
+                            received_code = get_github_otp_from_imap(
+                                acc.get("gmail_login", ""),
+                                acc.get("gmail_app_password", ""),
+                                chat_id=chat_id,
+                                repo_name=repo_name
+                            )
+                            if received_code: break
+                            time.sleep(5)
+                        
+                        if received_code:
+                            STATUS_TRACKER[repo_name]["status"] = f"Phase 1: Xác thực OTP ({received_code})..."
+                            STATUS_TRACKER[repo_name]["last_update"] = time.time()
+                            page.locator("input[id='app_totp'], input[id='otp'], input[name='otp'], input[id='verification_code']").fill(received_code)
+                            page.keyboard.press("Enter")
+                            for _ in range(20):
+                                if page.locator("div.workbench, .monaco-workbench").first.is_visible(): break
+                                time.sleep(0.5)
+                        else:
+                            STATUS_TRACKER[repo_name]["status"] = "❌ Phase 1: Kẹt OTP Gmail"
+                            STATUS_TRACKER[repo_name]["last_update"] = time.time()
+                            send_debug_screenshot(page, repo_name, chat_id, "Phase 1: Không lấy được OTP sau 20 lần thử")
+                            if is_locked:
+                                otp_lock.release()
+                                is_locked = False
+                            return False
+            
+            try:
+                page.locator("div.workbench, .monaco-workbench").wait_for(state="visible", timeout=15000)
+            except:
+                pass
+            
+            if is_locked:
+                otp_lock.release()
+                is_locked = False
+            
+            STATUS_TRACKER[repo_name]["status"] = "✅ Phase 1: Login OK, đã lưu cookie"
+            STATUS_TRACKER[repo_name]["last_update"] = time.time()
+            return True
+        except Exception as e:
+            STATUS_TRACKER[repo_name]["status"] = f"❌ Phase 1 lỗi: {str(e)[:40]}"
+            STATUS_TRACKER[repo_name]["last_update"] = time.time()
+            try:
+                if 'page' in locals():
+                    send_debug_screenshot(page, repo_name, chat_id, f"Phase 1 Exception: {str(e)[:50]}")
+            except:
+                pass
+            return False
+        finally:
+            if is_locked:
+                otp_lock.release()
+            if context:
+                context.close()
+
+def start_new_codespace_pipeline(acc, repo, chat_id, bot_index=0, otp_lock=None):
+    """PHASE 3: Tạo codespace mới và vào workspace, chờ terminal, mở terminal mới.
+    Sử dụng cookie đã lưu từ Phase 1 (không login lại trừ khi cookie hết hạn)."""
+    global LOG_NEEDS_REPOST
+    repo_name = repo["name"]
+    
+    if bot_index > 0:
+        delay_time = bot_index * 25
+        STATUS_TRACKER[repo_name]["status"] = f"💤 Phase 3: Giãn cách (Chờ {delay_time}s)..."
+        STATUS_TRACKER[repo_name]["last_update"] = time.time()
+        time.sleep(delay_time)
+    
+    STATUS_TRACKER[repo_name]["status"] = "🚀 Phase 3: Đang tạo codespace mới..."
+    STATUS_TRACKER[repo_name]["last_update"] = time.time()
+    
+    web_url = create_codespace_via_api(acc["github_token"], repo["url"])
+    if not web_url:
+        STATUS_TRACKER[repo_name]["status"] = "❌ Phase 3: Lỗi API GitHub"
+        STATUS_TRACKER[repo_name]["last_update"] = time.time()
+        return
+    
+    with sync_playwright() as p:
+        context = None
+        is_locked = False
+        try:
+            STATUS_TRACKER[repo_name]["status"] = "Phase 3: Khởi động trình duyệt..."
+            STATUS_TRACKER[repo_name]["last_update"] = time.time()
+            ram_optimize_args = [
+                "--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu",
+                "--disable-dev-shm-usage", "--js-flags=--max-old-space-size=100",
+                "--disable-extensions", "--mute-audio"
+            ]
+            user_data_dir = f"./browser_profiles/{repo_name}"
+            context = p.chromium.launch_persistent_context(user_data_dir, headless=True, args=ram_optimize_args)
+            page = context.new_page()
+            
+            page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
+            
+            STATUS_TRACKER[repo_name]["status"] = "Phase 3: Đang tải trang kết nối..."
+            STATUS_TRACKER[repo_name]["last_update"] = time.time()
+            page.goto(web_url, timeout=30000, wait_until="commit")
+            
+            for _ in range(16):
+                if page.locator("div.workbench, div#monaco-parts-splash, .monaco-workbench, input[name='login']").first.is_visible(): break
+                time.sleep(0.5)
+            
+            is_workspace = page.locator("div.workbench, div#monaco-parts-splash, .monaco-workbench").is_visible()
+            
+            if not is_workspace:
+                if page.locator("input[name='login']").is_visible() or "login" in page.url.lower():
+                    STATUS_TRACKER[repo_name]["status"] = "Phase 3: Cookie hết hạn, đang login lại..."
+                    STATUS_TRACKER[repo_name]["last_update"] = time.time()
+                    
+                    if otp_lock:
+                        otp_lock.acquire()
+                        is_locked = True
+                    
+                    username = acc.get("account_id", "").strip()
+                    password = acc.get("github_password", "").strip()
+                    if not username or not password:
+                        STATUS_TRACKER[repo_name]["status"] = "❌ Phase 3: Thiếu username/password"
+                        STATUS_TRACKER[repo_name]["last_update"] = time.time()
                         return
                     
                     page.fill("input[name='login']", username)
@@ -369,9 +660,9 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                     error_element = page.locator(".flash-error, #js-flash-container .flash-error, div.flash-error")
                     if error_element.count() > 0 and error_element.is_visible():
                         error_text = error_element.inner_text()
-                        STATUS_TRACKER[repo_name]["status"] = f"Offline: Đăng nhập thất bại ❌"
+                        STATUS_TRACKER[repo_name]["status"] = "❌ Phase 3: Login lại thất bại"
                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                        send_debug_screenshot(page, repo_name, chat_id, f"Login lỗi: {error_text[:100]}")
+                        send_debug_screenshot(page, repo_name, chat_id, f"Phase 3 login lỗi: {error_text[:100]}")
                         if is_locked:
                             otp_lock.release()
                             is_locked = False
@@ -380,63 +671,59 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                     for _ in range(16):
                         if page.locator("div.workbench, input[id='app_totp'], input[id='otp'], input[name='otp']").first.is_visible(): break
                         time.sleep(0.5)
-                        
+                    
                     if page.locator("input[id='app_totp'], input[id='otp'], input[name='otp'], input[id='verification_code']").first.is_visible():
-                        STATUS_TRACKER[repo_name]["status"] = "🤖 Đang quét giải mã OTP từ Gmail..."
+                        STATUS_TRACKER[repo_name]["status"] = "Phase 3: Đang quét OTP..."
                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
                         received_code = None
                         for _ in range(20):
                             received_code = get_github_otp_from_imap(
-                                acc.get("gmail_login", ""), 
+                                acc.get("gmail_login", ""),
                                 acc.get("gmail_app_password", ""),
                                 chat_id=chat_id,
                                 repo_name=repo_name
                             )
                             if received_code: break
                             time.sleep(5)
-                            
+                        
                         if received_code:
-                            STATUS_TRACKER[repo_name]["status"] = f"🎯 Xác thực OTP ({received_code})... ⚙️"
-                            STATUS_TRACKER[repo_name]["last_update"] = time.time()
                             page.locator("input[id='app_totp'], input[id='otp'], input[name='otp'], input[id='verification_code']").fill(received_code)
                             page.keyboard.press("Enter")
                             for _ in range(20):
                                 if page.locator("div.workbench, .monaco-workbench").first.is_visible(): break
                                 time.sleep(0.5)
                         else:
-                            STATUS_TRACKER[repo_name]["status"] = "Offline: Kẹt OTP Gmail ❌"
+                            STATUS_TRACKER[repo_name]["status"] = "❌ Phase 3: Kẹt OTP"
                             STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                            send_debug_screenshot(page, repo_name, chat_id, "Không lấy được OTP từ Gmail sau 20 lần thử")
+                            send_debug_screenshot(page, repo_name, chat_id, "Phase 3: Không lấy được OTP")
                             if is_locked:
                                 otp_lock.release()
                                 is_locked = False
                             return
-
+                    
+                    if is_locked:
+                        otp_lock.release()
+                        is_locked = False
+            
             try:
                 page.locator("div.workbench, .monaco-workbench").wait_for(state="visible", timeout=15000)
             except:
                 pass
-
-            if is_locked:
-                STATUS_TRACKER[repo_name]["status"] = "🔌 Đã vượt OTP, nhường khóa cho bot sau..."
-                STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                otp_lock.release()
-                is_locked = False
-
-            STATUS_TRACKER[repo_name]["status"] = "⏳ Đang đợi Codespace nạp Terminal..."
+            
+            STATUS_TRACKER[repo_name]["status"] = "Phase 3: Đang đợi Codespace nạp Terminal..."
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             
             terminal_ready = wait_for_terminal_with_reload(page, repo_name, chat_id, max_iterations=45, sleep_interval=4)
             
             if not terminal_ready:
-                STATUS_TRACKER[repo_name]["status"] = "Offline: Quá thời gian nạp Terminal (GitHub Treo) ❌"
+                STATUS_TRACKER[repo_name]["status"] = "❌ Phase 3: Timeout Terminal (GitHub Treo)"
                 STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                send_debug_screenshot(page, repo_name, chat_id, "Timeout Terminal - GitHub Treo")
-                return 
+                send_debug_screenshot(page, repo_name, chat_id, "Phase 3 Timeout Terminal")
+                return
             
-            time.sleep(3) 
+            time.sleep(3)
             
-            STATUS_TRACKER[repo_name]["status"] = "⌨️ Ép mở Terminal mới để chạy lệnh..."
+            STATUS_TRACKER[repo_name]["status"] = "⌨️ Phase 3: Ép mở Terminal mới..."
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             page.keyboard.press("F1")
             time.sleep(1)
@@ -451,161 +738,362 @@ def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                 with open(screenshot_path, "rb") as photo:
                     bot.send_photo(chat_id, photo, caption=f"🎉 [KÍCH HOẠT THÀNH CÔNG - {repo_name.upper()}]\n✅ Hệ thống đã ép mở Terminal mới ổn định!")
                 os.remove(screenshot_path)
-                LOG_NEEDS_REPOST = True  
-                
+                LOG_NEEDS_REPOST = True
+            
             STATUS_TRACKER[repo_name]["status"] = "Active: Đã kích hoạt hoàn tất 🟢"
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             ACTIVE_BROWSERS[repo_name] = {"active": True}
         except Exception as e:
-            STATUS_TRACKER[repo_name]["status"] = "Offline: Lỗi nạp phiên chạy ❌"
+            STATUS_TRACKER[repo_name]["status"] = "❌ Phase 3: Lỗi nạp phiên chạy"
             STATUS_TRACKER[repo_name]["last_update"] = time.time()
             try:
                 if 'page' in locals():
-                    send_debug_screenshot(page, repo_name, chat_id, f"Exception: {str(e)[:50]}")
+                    send_debug_screenshot(page, repo_name, chat_id, f"Phase 3 Exception: {str(e)[:50]}")
             except:
                 pass
         finally:
-            if is_locked:
+            if is_locked and otp_lock:
                 otp_lock.release()
             if context:
-                context.close()  
+                context.close()
 
-def process_login_task(task):
-    global LOG_NEEDS_REPOST
-    acc, repo, chat_id = task["acc"], task["repo"], task["chat_id"]
-    repo_name = repo["name"]
-    
-    STATUS_TRACKER[repo_name]["status"] = "Đang điều phối API... 🚀"
-    STATUS_TRACKER[repo_name]["last_update"] = time.time()
-    
-    web_url = create_codespace_via_api(acc["github_token"], repo["url"])
-    if not web_url:
-        STATUS_TRACKER[repo_name]["status"] = "Thất bại: Lỗi API GitHub ❌"
-        return
+# ====================================================================
+# [DEPRECATED - ĐÃ COMMENT OUT]
+# Hàm run_single_bot_pipeline trước đây xử lý toàn bộ pipeline cho 1 repo
+# trong 1 lần chạy duy nhất: create codespace + login + OTP + chờ terminal
+# + mở terminal mới.
+# Lý do comment out:
+#   - Không có bước stop codespace cũ → tài nguyên không hồi.
+#   - Không tách biệt login và start → không thể stop codespace sau khi
+#     đã login mà trước khi start phiên mới.
+# Thay thế bằng:
+#   - login_only_pipeline() — Phase 1: login + lưu cookie.
+#   - stop_target_repos_codespaces() — Phase 2: stop qua API.
+#   - start_new_codespace_pipeline() — Phase 3: start codespace mới.
+# Cả 3 hàm được gọi tuần tự trong process_account_batch_task().
+# ====================================================================
+# def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
+#     global LOG_NEEDS_REPOST
+#     repo_name = repo["name"]
+#     
+#     if bot_index > 0:
+#         delay_time = bot_index * 25
+#         STATUS_TRACKER[repo_name]["status"] = f"💤 Giãn cách pha (Chờ {delay_time}s hạ nhiệt CPU)..."
+#         STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#         time.sleep(delay_time)
+#     
+#     STATUS_TRACKER[repo_name]["status"] = "Đang điều phối API... 🚀"
+#     STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#     
+#     web_url = create_codespace_via_api(acc["github_token"], repo["url"])
+#     if not web_url:
+#         STATUS_TRACKER[repo_name]["status"] = "Thất bại: Lỗi API GitHub ❌"
+#         return
+#
+#     with sync_playwright() as p:
+#         context = None
+#         is_locked = False
+#         try:
+#             STATUS_TRACKER[repo_name]["status"] = "Khởi động lõi ảo cấu hình... 🌐"
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             ram_optimize_args = [
+#                 "--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu",                  
+#                 "--disable-dev-shm-usage", "--js-flags=--max-old-space-size=100", 
+#                 "--disable-extensions", "--mute-audio"                     
+#             ]
+#             user_data_dir = f"./browser_profiles/{repo_name}"
+#             context = p.chromium.launch_persistent_context(user_data_dir, headless=True, args=ram_optimize_args)
+#             page = context.new_page()
+#             
+#             page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
+#             
+#             if otp_lock:
+#                 otp_lock.acquire()
+#                 is_locked = True
+#                 
+#             STATUS_TRACKER[repo_name]["status"] = "Đang tải trang kết nối... ⏳"
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             page.goto(web_url, timeout=30000, wait_until="commit")
+#             
+#             for _ in range(16):
+#                 if page.locator("div.workbench, div#monaco-parts-splash, .monaco-workbench, input[name='login']").first.is_visible(): break
+#                 time.sleep(0.5)
+#                 
+#             is_workspace = page.locator("div.workbench, div#monaco-parts-splash, .monaco-workbench").is_visible()
+#             if not is_workspace:
+#                 if page.locator("input[name='login']").is_visible() or "login" in page.url.lower():
+#                     STATUS_TRACKER[repo_name]["status"] = "Nạp thông tin bảo mật... 🔐"
+#                     STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                     
+#                     username = acc.get("account_id", "").strip()
+#                     password = acc.get("github_password", "").strip()
+#                     if not username or not password:
+#                         STATUS_TRACKER[repo_name]["status"] = "Offline: Thiếu username hoặc password ❌"
+#                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                         send_debug_screenshot(page, repo_name, chat_id, "Thiếu username/password trong accounts.json")
+#                         if is_locked:
+#                             otp_lock.release()
+#                             is_locked = False
+#                         return
+#                     
+#                     page.fill("input[name='login']", username)
+#                     page.fill("input[name='password']", password)
+#                     page.click("input[type='submit']")
+#                     time.sleep(3)
+#                     
+#                     error_element = page.locator(".flash-error, #js-flash-container .flash-error, div.flash-error")
+#                     if error_element.count() > 0 and error_element.is_visible():
+#                         error_text = error_element.inner_text()
+#                         STATUS_TRACKER[repo_name]["status"] = f"Offline: Đăng nhập thất bại ❌"
+#                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                         send_debug_screenshot(page, repo_name, chat_id, f"Login lỗi: {error_text[:100]}")
+#                         if is_locked:
+#                             otp_lock.release()
+#                             is_locked = False
+#                         return
+#                     
+#                     for _ in range(16):
+#                         if page.locator("div.workbench, input[id='app_totp'], input[id='otp'], input[name='otp']").first.is_visible(): break
+#                         time.sleep(0.5)
+#                         
+#                     if page.locator("input[id='app_totp'], input[id='otp'], input[name='otp'], input[id='verification_code']").first.is_visible():
+#                         STATUS_TRACKER[repo_name]["status"] = "🤖 Đang quét giải mã OTP từ Gmail..."
+#                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                         received_code = None
+#                         for _ in range(20):
+#                             received_code = get_github_otp_from_imap(
+#                                 acc.get("gmail_login", ""), 
+#                                 acc.get("gmail_app_password", ""),
+#                                 chat_id=chat_id,
+#                                 repo_name=repo_name
+#                             )
+#                             if received_code: break
+#                             time.sleep(5)
+#                             
+#                         if received_code:
+#                             STATUS_TRACKER[repo_name]["status"] = f"🎯 Xác thực OTP ({received_code})... ⚙️"
+#                             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                             page.locator("input[id='app_totp'], input[id='otp'], input[name='otp'], input[id='verification_code']").fill(received_code)
+#                             page.keyboard.press("Enter")
+#                             for _ in range(20):
+#                                 if page.locator("div.workbench, .monaco-workbench").first.is_visible(): break
+#                                 time.sleep(0.5)
+#                         else:
+#                             STATUS_TRACKER[repo_name]["status"] = "Offline: Kẹt OTP Gmail ❌"
+#                             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                             send_debug_screenshot(page, repo_name, chat_id, "Không lấy được OTP từ Gmail sau 20 lần thử")
+#                             if is_locked:
+#                                 otp_lock.release()
+#                                 is_locked = False
+#                             return
+#
+#             try:
+#                 page.locator("div.workbench, .monaco-workbench").wait_for(state="visible", timeout=15000)
+#             except:
+#                 pass
+#
+#             if is_locked:
+#                 STATUS_TRACKER[repo_name]["status"] = "🔌 Đã vượt OTP, nhường khóa cho bot sau..."
+#                 STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                 otp_lock.release()
+#                 is_locked = False
+#
+#             STATUS_TRACKER[repo_name]["status"] = "⏳ Đang đợi Codespace nạp Terminal..."
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             
+#             terminal_ready = wait_for_terminal_with_reload(page, repo_name, chat_id, max_iterations=45, sleep_interval=4)
+#             
+#             if not terminal_ready:
+#                 STATUS_TRACKER[repo_name]["status"] = "Offline: Quá thời gian nạp Terminal (GitHub Treo) ❌"
+#                 STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                 send_debug_screenshot(page, repo_name, chat_id, "Timeout Terminal - GitHub Treo")
+#                 return 
+#             
+#             time.sleep(3) 
+#             
+#             STATUS_TRACKER[repo_name]["status"] = "⌨️ Ép mở Terminal mới để chạy lệnh..."
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             page.keyboard.press("F1")
+#             time.sleep(1)
+#             page.keyboard.type("Terminal: Create New Terminal")
+#             time.sleep(0.5)
+#             page.keyboard.press("Enter")
+#             
+#             time.sleep(5)
+#             screenshot_path = f"success_{repo_name}.png"
+#             page.screenshot(path=screenshot_path)
+#             if os.path.exists(screenshot_path):
+#                 with open(screenshot_path, "rb") as photo:
+#                     bot.send_photo(chat_id, photo, caption=f"🎉 [KÍCH HOẠT THÀNH CÔNG - {repo_name.upper()}]\n✅ Hệ thống đã ép mở Terminal mới ổn định!")
+#                 os.remove(screenshot_path)
+#                 LOG_NEEDS_REPOST = True  
+#                 
+#             STATUS_TRACKER[repo_name]["status"] = "Active: Đã kích hoạt hoàn tất 🟢"
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             ACTIVE_BROWSERS[repo_name] = {"active": True}
+#         except Exception as e:
+#             STATUS_TRACKER[repo_name]["status"] = "Offline: Lỗi nạp phiên chạy ❌"
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             try:
+#                 if 'page' in locals():
+#                     send_debug_screenshot(page, repo_name, chat_id, f"Exception: {str(e)[:50]}")
+#             except:
+#                 pass
+#         finally:
+#             if is_locked:
+#                 otp_lock.release()
+#             if context:
+#                 context.close()
 
-    with sync_playwright() as p:
-        context = None
-        try:
-            STATUS_TRACKER[repo_name]["status"] = "Khởi động lõi ảo cấu hình... 🌐"
-            STATUS_TRACKER[repo_name]["last_update"] = time.time()
-            ram_optimize_args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--js-flags=--max-old-space-size=100", "--disable-extensions", "--mute-audio"]
-            user_data_dir = f"./browser_profiles/{repo_name}"
-            context = p.chromium.launch_persistent_context(user_data_dir, headless=True, args=ram_optimize_args)
-            page = context.new_page()
-            
-            page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
-            
-            STATUS_TRACKER[repo_name]["status"] = "Đang tải trang kết nối... ⏳"
-            STATUS_TRACKER[repo_name]["last_update"] = time.time()
-            page.goto(web_url, timeout=30000, wait_until="commit")
-            
-            for _ in range(16):
-                if page.locator("div.workbench, div#monaco-parts-splash, .monaco-workbench, input[name='login']").first.is_visible(): break
-                time.sleep(0.5)
-                
-            is_workspace = page.locator("div.workbench, div#monaco-parts-splash, .monaco-workbench").is_visible()
-            if not is_workspace:
-                if page.locator("input[name='login']").is_visible() or "login" in page.url.lower():
-                    STATUS_TRACKER[repo_name]["status"] = "Nạp thông tin bảo mật... 🔐"
-                    STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                    
-                    username = acc.get("account_id", "").strip()
-                    password = acc.get("github_password", "").strip()
-                    if not username or not password:
-                        STATUS_TRACKER[repo_name]["status"] = "Offline: Thiếu username hoặc password ❌"
-                        STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                        send_debug_screenshot(page, repo_name, chat_id, "Thiếu username/password trong accounts.json")
-                        return
-                    
-                    page.fill("input[name='login']", username)
-                    page.fill("input[name='password']", password)
-                    page.click("input[type='submit']")
-                    time.sleep(3)
-                    
-                    error_element = page.locator(".flash-error, #js-flash-container .flash-error, div.flash-error")
-                    if error_element.count() > 0 and error_element.is_visible():
-                        error_text = error_element.inner_text()
-                        STATUS_TRACKER[repo_name]["status"] = f"Offline: Đăng nhập thất bại ❌"
-                        STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                        send_debug_screenshot(page, repo_name, chat_id, f"Login lỗi: {error_text[:100]}")
-                        return
-                    
-                    for _ in range(16):
-                        if page.locator("div.workbench, input[id='app_totp'], input[id='otp'], input[name='otp']").first.is_visible(): break
-                        time.sleep(0.5)
-                        
-                    if page.locator("input[id='app_totp'], input[id='otp'], input[name='otp'], input[id='verification_code']").first.is_visible():
-                        STATUS_TRACKER[repo_name]["status"] = "🤖 Đang quét giải mã OTP từ Gmail..."
-                        STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                        received_code = None
-                        for _ in range(20):
-                            received_code = get_github_otp_from_imap(
-                                acc.get("gmail_login", ""), 
-                                acc.get("gmail_app_password", ""),
-                                chat_id=chat_id,
-                                repo_name=repo_name
-                            )
-                            if received_code: break
-                            time.sleep(5)
-                            
-                        if received_code:
-                            STATUS_TRACKER[repo_name]["status"] = f"🎯 Xác thực OTP ({received_code})... ⚙️"
-                            STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                            page.locator("input[id='app_totp'], input[id='otp'], input[name='otp'], input[id='verification_code']").fill(received_code)
-                            page.keyboard.press("Enter")
-                            for _ in range(20):
-                                if page.locator("div.workbench, .monaco-workbench").first.is_visible(): break
-                                time.sleep(0.5)
-                        else:
-                            STATUS_TRACKER[repo_name]["status"] = "Offline: Kẹt OTP Gmail ❌"
-                            STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                            send_debug_screenshot(page, repo_name, chat_id, "Không lấy được OTP từ Gmail sau 20 lần thử")
-                            return
-
-            STATUS_TRACKER[repo_name]["status"] = "⏳ Đang đợi Codespace nạp Terminal..."
-            STATUS_TRACKER[repo_name]["last_update"] = time.time()
-            
-            terminal_ready = wait_for_terminal_with_reload(page, repo_name, chat_id, max_iterations=45, sleep_interval=4)
-            
-            if not terminal_ready:
-                STATUS_TRACKER[repo_name]["status"] = "Offline: Quá thời gian nạp Terminal (GitHub Treo) ❌"
-                STATUS_TRACKER[repo_name]["last_update"] = time.time()
-                send_debug_screenshot(page, repo_name, chat_id, "Timeout Terminal - GitHub Treo")
-                return
-            
-            time.sleep(3)
-            
-            STATUS_TRACKER[repo_name]["status"] = "⌨️ Ép mở Terminal mới để chạy lệnh..."
-            STATUS_TRACKER[repo_name]["last_update"] = time.time()
-            page.keyboard.press("F1")
-            time.sleep(1)
-            page.keyboard.type("Terminal: Create New Terminal")
-            time.sleep(0.5)
-            page.keyboard.press("Enter")
-            
-            time.sleep(5)
-            screenshot_path = f"success_{repo_name}.png"
-            page.screenshot(path=screenshot_path)
-            if os.path.exists(screenshot_path):
-                with open(screenshot_path, "rb") as photo:
-                    bot.send_photo(chat_id, photo, caption=f"🎉 [KÍCH HOẠT THÀNH CÔNG - {repo_name.upper()}]\n✅ Hệ thống đã ép mở Terminal mới và kích hoạt toàn bộ chuỗi bot con ổn định!")
-                os.remove(screenshot_path)
-                LOG_NEEDS_REPOST = True
-                
-            STATUS_TRACKER[repo_name]["status"] = "Active: Đã kích hoạt hoàn tất 🟢"
-            STATUS_TRACKER[repo_name]["last_update"] = time.time()
-            ACTIVE_BROWSERS[repo_name] = {"active": True}
-        except Exception as e:
-            STATUS_TRACKER[repo_name]["status"] = "Offline: Lỗi nạp phiên chạy ❌"
-            STATUS_TRACKER[repo_name]["last_update"] = time.time()
-            try:
-                if 'page' in locals():
-                    send_debug_screenshot(page, repo_name, chat_id, f"Exception: {str(e)[:50]}")
-            except:
-                pass
-        finally:
-            if context:
-                context.close()  
+# ====================================================================
+# [DEPRECATED - ĐÃ COMMENT OUT]
+# Hàm process_login_task trước đây xử lý task type "login":
+#   - Nhận 1 repo cụ thể, mở browser, login + OTP, chờ terminal
+#   - Không có bước stop codespace → tài nguyên không hồi
+# Lý do comment out:
+#   - reset_multiple_bots đã chuyển sang dùng task "account_batch"
+#     để nhóm các repo theo account, chạy Phase 1-2-3 đầy đủ.
+#   - Hàm cũ không còn được gọi từ bất kỳ đâu.
+# Nếu cần khôi phục: bỏ comment hàm này và bỏ comment 2 dòng
+#   elif task_type == "login": process_login_task(task)
+#   trong playwright_queue_processor.
+# ====================================================================
+# def process_login_task(task):
+#     global LOG_NEEDS_REPOST
+#     acc, repo, chat_id = task["acc"], task["repo"], task["chat_id"]
+#     repo_name = repo["name"]
+#     
+#     STATUS_TRACKER[repo_name]["status"] = "Đang điều phối API... 🚀"
+#     STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#     
+#     web_url = create_codespace_via_api(acc["github_token"], repo["url"])
+#     if not web_url:
+#         STATUS_TRACKER[repo_name]["status"] = "Thất bại: Lỗi API GitHub ❌"
+#         return
+#
+#     with sync_playwright() as p:
+#         context = None
+#         try:
+#             STATUS_TRACKER[repo_name]["status"] = "Khởi động lõi ảo cấu hình... 🌐"
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             ram_optimize_args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--js-flags=--max-old-space-size=100", "--disable-extensions", "--mute-audio"]
+#             user_data_dir = f"./browser_profiles/{repo_name}"
+#             context = p.chromium.launch_persistent_context(user_data_dir, headless=True, args=ram_optimize_args)
+#             page = context.new_page()
+#             
+#             page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
+#             
+#             STATUS_TRACKER[repo_name]["status"] = "Đang tải trang kết nối... ⏳"
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             page.goto(web_url, timeout=30000, wait_until="commit")
+#             
+#             for _ in range(16):
+#                 if page.locator("div.workbench, div#monaco-parts-splash, .monaco-workbench, input[name='login']").first.is_visible(): break
+#                 time.sleep(0.5)
+#                 
+#             is_workspace = page.locator("div.workbench, div#monaco-parts-splash, .monaco-workbench").is_visible()
+#             if not is_workspace:
+#                 if page.locator("input[name='login']").is_visible() or "login" in page.url.lower():
+#                     STATUS_TRACKER[repo_name]["status"] = "Nạp thông tin bảo mật... 🔐"
+#                     STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                     
+#                     username = acc.get("account_id", "").strip()
+#                     password = acc.get("github_password", "").strip()
+#                     if not username or not password:
+#                         STATUS_TRACKER[repo_name]["status"] = "Offline: Thiếu username hoặc password ❌"
+#                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                         send_debug_screenshot(page, repo_name, chat_id, "Thiếu username/password trong accounts.json")
+#                         return
+#                     
+#                     page.fill("input[name='login']", username)
+#                     page.fill("input[name='password']", password)
+#                     page.click("input[type='submit']")
+#                     time.sleep(3)
+#                     
+#                     error_element = page.locator(".flash-error, #js-flash-container .flash-error, div.flash-error")
+#                     if error_element.count() > 0 and error_element.is_visible():
+#                         error_text = error_element.inner_text()
+#                         STATUS_TRACKER[repo_name]["status"] = f"Offline: Đăng nhập thất bại ❌"
+#                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                         send_debug_screenshot(page, repo_name, chat_id, f"Login lỗi: {error_text[:100]}")
+#                         return
+#                     
+#                     for _ in range(16):
+#                         if page.locator("div.workbench, input[id='app_totp'], input[id='otp'], input[name='otp']").first.is_visible(): break
+#                         time.sleep(0.5)
+#                         
+#                     if page.locator("input[id='app_totp'], input[id='otp'], input[name='otp'], input[id='verification_code']").first.is_visible():
+#                         STATUS_TRACKER[repo_name]["status"] = "🤖 Đang quét giải mã OTP từ Gmail..."
+#                         STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                         received_code = None
+#                         for _ in range(20):
+#                             received_code = get_github_otp_from_imap(
+#                                 acc.get("gmail_login", ""), 
+#                                 acc.get("gmail_app_password", ""),
+#                                 chat_id=chat_id,
+#                                 repo_name=repo_name
+#                             )
+#                             if received_code: break
+#                             time.sleep(5)
+#                             
+#                         if received_code:
+#                             STATUS_TRACKER[repo_name]["status"] = f"🎯 Xác thực OTP ({received_code})... ⚙️"
+#                             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                             page.locator("input[id='app_totp'], input[id='otp'], input[name='otp'], input[id='verification_code']").fill(received_code)
+#                             page.keyboard.press("Enter")
+#                             for _ in range(20):
+#                                 if page.locator("div.workbench, .monaco-workbench").first.is_visible(): break
+#                                 time.sleep(0.5)
+#                         else:
+#                             STATUS_TRACKER[repo_name]["status"] = "Offline: Kẹt OTP Gmail ❌"
+#                             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                             send_debug_screenshot(page, repo_name, chat_id, "Không lấy được OTP từ Gmail sau 20 lần thử")
+#                             return
+#
+#             STATUS_TRACKER[repo_name]["status"] = "⏳ Đang đợi Codespace nạp Terminal..."
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             
+#             terminal_ready = wait_for_terminal_with_reload(page, repo_name, chat_id, max_iterations=45, sleep_interval=4)
+#             
+#             if not terminal_ready:
+#                 STATUS_TRACKER[repo_name]["status"] = "Offline: Quá thời gian nạp Terminal (GitHub Treo) ❌"
+#                 STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#                 send_debug_screenshot(page, repo_name, chat_id, "Timeout Terminal - GitHub Treo")
+#                 return
+#             
+#             time.sleep(3)
+#             
+#             STATUS_TRACKER[repo_name]["status"] = "⌨️ Ép mở Terminal mới để chạy lệnh..."
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             page.keyboard.press("F1")
+#             time.sleep(1)
+#             page.keyboard.type("Terminal: Create New Terminal")
+#             time.sleep(0.5)
+#             page.keyboard.press("Enter")
+#             
+#             time.sleep(5)
+#             screenshot_path = f"success_{repo_name}.png"
+#             page.screenshot(path=screenshot_path)
+#             if os.path.exists(screenshot_path):
+#                 with open(screenshot_path, "rb") as photo:
+#                     bot.send_photo(chat_id, photo, caption=f"🎉 [KÍCH HOẠT THÀNH CÔNG - {repo_name.upper()}]\n✅ Hệ thống đã ép mở Terminal mới và kích hoạt toàn bộ chuỗi bot con ổn định!")
+#                 os.remove(screenshot_path)
+#                 LOG_NEEDS_REPOST = True
+#                 
+#             STATUS_TRACKER[repo_name]["status"] = "Active: Đã kích hoạt hoàn tất 🟢"
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             ACTIVE_BROWSERS[repo_name] = {"active": True}
+#         except Exception as e:
+#             STATUS_TRACKER[repo_name]["status"] = "Offline: Lỗi nạp phiên chạy ❌"
+#             STATUS_TRACKER[repo_name]["last_update"] = time.time()
+#             try:
+#                 if 'page' in locals():
+#                     send_debug_screenshot(page, repo_name, chat_id, f"Exception: {str(e)[:50]}")
+#             except:
+#                 pass
+#         finally:
+#             if context:
+#                 context.close()
 
 def process_resetcmd_task(task):
     global LOG_NEEDS_REPOST
@@ -846,16 +1334,16 @@ def send_help_menu(message):
     if not is_admin(message): return
     help_text = (
         f"📖 **HƯỚNG DẪN ĐIỀU HÀNH HỆ THỐNG TRƠN TRU**\n\n"
-        f"🚀 `/startall` : Kích hoạt toàn bộ danh sách bot.\n"
+        f"🚀 `/startall` : Kích hoạt toàn bộ danh sách bot (Phase 1 login → Phase 2 stop → Phase 3 start).\n"
         f"🎯 `/startall bot2 bot3` : Chỉ kích hoạt đích danh bot2 và bot3 chỉ định.\n"
         f"📊 `/startbot` : Kiểm tra trạng thái máy ảo trực tiếp từ GitHub.\n"
         f"🛑 `/shutdown [Tên_Bot]` : Ép tắt làm sạch kẹt slot trên tài khoản.\n"
-        f"🔄 `/reset [Tên_Bot]` : Khởi động lại một phiên đăng nhập đơn lẻ.\n"
+        f"🔄 `/reset [Tên_Bot]` : Reset (login → stop → start) các bot được chỉ định.\n"
         f"⚡ `/resetcmd [Bot1] [Bot2]` : Sạch Terminal tuần tự xếp hàng 100% không lỗi luồng.\n"
         f"📸 `/anh [Tên_Bot]` : Chụp ảnh giao diện không lo sập RAM.\n"
         f"🖥️ `/start` : Xem thông số phần cứng thực tế của VPS.\n"
         f"📤 `/upload` : Upload file `accounts.json` mới từ Telegram.\n"
-        f"⚠️ Lệnh /startall hỗ trợ chọn lọc bot tùy biến mà vẫn bảo lưu khóa OTP theo cụm tài khoản."
+        f"⚠️ Lệnh /startall và /reset hỗ trợ chọn lọc bot tùy biến mà vẫn bảo lưu khóa OTP theo cụm tài khoản."
     )
     bot.reply_to(message, help_text, parse_mode="Markdown")
     LOG_NEEDS_REPOST = True
@@ -869,17 +1357,52 @@ def reset_multiple_bots(message):
     target_repos = list(set([r.strip().lower() for r in parts[1:]]))
     accounts = load_accounts()
     
+    # Nhóm các target_repos theo account (account nào chứa repo nào)
+    account_groups = {}
     for target_repo in target_repos:
-        found_acc, found_repo = None, None
         for acc in accounts:
+            matched = False
             for r in acc["repos"]:
                 if r["name"].lower() == target_repo:
-                    found_acc, found_repo = acc, r
+                    acc_id = acc["account_id"]
+                    if acc_id not in account_groups:
+                        account_groups[acc_id] = {"acc": acc, "repos": []}
+                    account_groups[acc_id]["repos"].append(r)
+                    matched = True
                     break
-        if not found_repo: continue
-        if target_repo in ACTIVE_BROWSERS: del ACTIVE_BROWSERS[target_repo]
-        STATUS_TRACKER[target_repo] = {"status": "Chờ xếp hàng đăng nhập... ⏳", "acc": found_acc["account_id"], "last_update": time.time()}
-        PLAYWRIGHT_QUEUE.put({"type": "login", "acc": found_acc, "repo": found_repo, "chat_id": message.chat.id})
+            if matched:
+                break
+    
+    if not account_groups:
+        bot.reply_to(message, f"❌ Không tìm thấy bot nào khớp với danh sách: `{', '.join(target_repos)}`", parse_mode="Markdown")
+        return
+    
+    total_repos = sum(len(g["repos"]) for g in account_groups.values())
+    bot.reply_to(message, f"⏳ Đã nhận yêu cầu reset `{total_repos}` bot (thuộc `{len(account_groups)}` tài khoản). Tiến trình: login → stop codespace → start codespace...", parse_mode="Markdown")
+    LOG_NEEDS_REPOST = True
+    
+    # Cập nhật STATUS_TRACKER ban đầu
+    for group in account_groups.values():
+        for repo in group["repos"]:
+            repo_name = repo["name"]
+            if repo_name in ACTIVE_BROWSERS:
+                del ACTIVE_BROWSERS[repo_name]
+            STATUS_TRACKER[repo_name] = {
+                "status": "Chờ xếp hàng reset (stop → start)... ⏳",
+                "acc": group["acc"]["account_id"],
+                "last_update": time.time()
+            }
+    
+    # Đẩy task account_batch cho mỗi account với mode="reset"
+    for group in account_groups.values():
+        PLAYWRIGHT_QUEUE.put({
+            "type": "account_batch",
+            "acc": group["acc"],
+            "chat_id": message.chat.id,
+            "repos": group["repos"],
+            "mode": "reset"
+        })
+    
     LOG_NEEDS_REPOST = True
 
 @bot.message_handler(commands=['clearcache'])
@@ -898,15 +1421,15 @@ def clear_cache_command(message):
 def start_all(message):
     if not is_admin(message): return
     global AUTO_STATUS_RUNNING
-    try: 
+    try:
         accounts = load_accounts()
-    except Exception as e: 
+    except Exception as e:
         bot.reply_to(message, f"❌ Lỗi đọc file cấu hình: {e}")
         return
     
     parts = message.text.split()
     target_bots = list(set([p.strip().lower() for p in parts[1:]])) if len(parts) > 1 else []
-
+    
     filtered_accounts = []
     if target_bots:
         for acc in accounts:
@@ -921,24 +1444,33 @@ def start_all(message):
             return
     else:
         filtered_accounts = accounts
-
-    for acc in filtered_accounts:
-        Thread(target=clean_all_active_codespaces, args=(acc["github_token"],)).start()
-    time.sleep(2)
+    
+    # Đã bỏ Thread(clean_all_active_codespaces) + time.sleep(2) vì Phase 2 của
+    # process_account_batch_task sẽ tự stop codespace với cơ chế poll đúng.
     
     if target_bots:
-        bot.send_message(message.chat.id, f"⚡ Đang phân bổ các bot `{', '.join(target_bots).upper()}` vào hàng đợi...", parse_mode="Markdown")
+        bot.send_message(message.chat.id, f"⚡ Đang phân bổ các bot `{', '.join(target_bots).upper()}` vào hàng đợi (login → stop → start)...", parse_mode="Markdown")
     else:
-        bot.send_message(message.chat.id, "⚡ Đang phân bổ danh sách TÀI KHOẢN vào hàng đợi nạp phiên chạy...")
+        bot.send_message(message.chat.id, "⚡ Đang phân bổ danh sách TÀI KHOẢN vào hàng đợi nạp phiên chạy (login → stop → start)...")
     
     for acc in filtered_accounts:
         for repo in acc["repos"]:
             repo_name = repo["name"]
-            STATUS_TRACKER[repo_name] = {"status": "Chờ xếp hàng... ⏳", "acc": acc["account_id"], "last_update": time.time()}
-
+            STATUS_TRACKER[repo_name] = {
+                "status": "Chờ xếp hàng... ⏳",
+                "acc": acc["account_id"],
+                "last_update": time.time()
+            }
+    
     for acc in filtered_accounts:
-        PLAYWRIGHT_QUEUE.put({"type": "account_batch", "acc": acc, "chat_id": message.chat.id})
-            
+        PLAYWRIGHT_QUEUE.put({
+            "type": "account_batch",
+            "acc": acc,
+            "chat_id": message.chat.id,
+            "repos": acc["repos"],
+            "mode": "startall"
+        })
+    
     if not AUTO_STATUS_RUNNING:
         AUTO_STATUS_RUNNING = True
         Thread(target=send_auto_status, args=(message.chat.id,)).start()
@@ -957,9 +1489,9 @@ def send_auto_status(chat_id):
         
         try:
             if AUTO_STATUS_MESSAGE_ID is not None and LOG_NEEDS_REPOST:
-                try: 
+                try:
                     bot.delete_message(chat_id, AUTO_STATUS_MESSAGE_ID)
-                except: 
+                except:
                     pass
                 AUTO_STATUS_MESSAGE_ID = None
                 LOG_NEEDS_REPOST = False
@@ -973,10 +1505,10 @@ def send_auto_status(chat_id):
                 except Exception as edit_err:
                     err_str = str(edit_err).lower()
                     if "message is not modified" in err_str:
-                        pass 
+                        pass
                     elif "message to edit not found" in err_str or "chat not found" in err_str:
-                        AUTO_STATUS_MESSAGE_ID = None 
-        except: 
+                        AUTO_STATUS_MESSAGE_ID = None
+        except:
             pass
             
         time.sleep(10)
