@@ -113,7 +113,12 @@ def get_github_otp_from_imap(gmail_user, gmail_pass, chat_id=None, repo_name="")
                 pass
 
 def create_codespace_via_api(token, repo_url, max_retries=3):
-    """Tạo hoặc start codespace, retry tối đa 3 lần khi lỗi."""
+    """Start codespace có sẵn của repo qua API GitHub.
+    KHÔNG tạo codespace mới. Nếu repo không có codespace → trả None.
+    Nếu codespace đang Shutdown → gọi start.
+    Nếu codespace đang Available/Starting → trả web_url luôn (không start lại).
+    Nếu start fail → retry tối đa max_retries lần.
+    Trả về web_url nếu thành công, None nếu thất bại."""
     repo_path = repo_url.replace("https://github.com/", "").strip("/")
     api_url = f"https://api.github.com/repos/{repo_path}/codespaces"
     headers = {
@@ -121,28 +126,74 @@ def create_codespace_via_api(token, repo_url, max_retries=3):
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    for attempt in range(1, max_retries + 1):
+    
+    # Lấy danh sách codespace của repo
+    try:
+        res = requests.get(api_url, headers=headers, timeout=15)
+    except Exception as e:
+        print(f"Lỗi GET codespaces cho {repo_path}: {e}")
+        return None
+    
+    if res.status_code != 200:
+        print(f"GET codespaces trả về {res.status_code} cho {repo_path}")
+        return None
+    
+    codespaces = res.json().get("codespaces", [])
+    if not codespaces:
+        print(f"❌ Repo {repo_path} không có codespace nào. KHÔNG tạo mới.")
+        return None
+    
+    # Chỉ lấy codespace đầu tiên (theo yêu cầu: 1 repo = 1 codespace)
+    cs = codespaces[0]
+    cs_name = cs["name"]
+    cs_state = str(cs.get("state", "")).lower()
+    cs_web_url = cs.get("web_url")
+    
+    # Nếu codespace đã Available / Active / Starting → dùng luôn
+    if cs_state in ["available", "active", "starting", "awaiting"]:
+        print(f"ℹ️ Codespace {cs_name} đang state='{cs_state}', dùng web_url có sẵn.")
+        return cs_web_url
+    
+    # Nếu codespace đang ShuttingDown hoặc Provisioning → chờ ngắn rồi thử lại
+    if cs_state in ["shuttingdown", "shutting_down", "provisioning", "queued", "created"]:
+        print(f"⏳ Codespace {cs_name} đang state='{cs_state}', chờ 5s...")
+        time.sleep(5)
+        # Refresh state
         try:
-            res = requests.get(api_url, headers=headers, timeout=15)
-            if res.status_code == 200:
-                codespaces = res.json().get("codespaces", [])
-                if codespaces:
-                    cs = codespaces[0]
+            res2 = requests.get(api_url, headers=headers, timeout=15)
+            if res2.status_code == 200:
+                codespaces2 = res2.json().get("codespaces", [])
+                if codespaces2:
+                    cs = codespaces2[0]
                     cs_name = cs["name"]
-                    start_url = f"https://api.github.com/user/codespaces/{cs_name}/start"
-                    start_res = requests.post(start_url, headers=headers, timeout=15)
-                    if start_res.status_code in [200, 202]:
-                        return cs["web_url"]
-                    else:
-                        pass
-                payload = {"machine": "standardLinux32gb"}
-                create_res = requests.post(api_url, headers=headers, json=payload, timeout=15)
-                if create_res.status_code in [201, 202]:
-                    return create_res.json().get("web_url")
+                    cs_state = str(cs.get("state", "")).lower()
+                    cs_web_url = cs.get("web_url")
+                    if cs_state in ["available", "active", "starting", "awaiting"]:
+                        return cs_web_url
         except Exception as e:
-            print(f"Lỗi API GitHub (lần {attempt}): {e}")
-        if attempt < max_retries:
-            time.sleep(2 ** attempt)
+            print(f"Lỗi refresh codespace: {e}")
+    
+    # Nếu codespace đang Shutdown → gọi start với retry
+    if cs_state in ["shutdown", "unknown"]:
+        start_url = f"https://api.github.com/user/codespaces/{cs_name}/start"
+        for attempt in range(1, max_retries + 1):
+            try:
+                start_res = requests.post(start_url, headers=headers, timeout=15)
+                if start_res.status_code in [200, 202]:
+                    print(f"✅ Đã start codespace {cs_name} (lần {attempt}).")
+                    return cs_web_url
+                else:
+                    print(f"⚠️ Start codespace lần {attempt} trả về {start_res.status_code}")
+            except Exception as e:
+                print(f"Lỗi start codespace (lần {attempt}): {e}")
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)
+        
+        print(f"❌ Start codespace {cs_name} thất bại sau {max_retries} lần. KHÔNG tạo mới.")
+        return None
+    
+    # Các state khác (failed, deleted, unavailable, moved, archived, exporting, rebuilding, updating)
+    print(f"❌ Codespace {cs_name} ở state='{cs_state}' không start được. KHÔNG tạo mới.")
     return None
 
 # ====================================================================
@@ -205,7 +256,7 @@ def stop_target_repos_codespaces(token, repo_urls, chat_id=None):
                 codespaces = res.json().get("codespaces", [])
                 for cs in codespaces:
                     state = str(cs.get("state", "")).lower()
-                    if state not in ["shutdown", "shutting_down"]:
+                    if state not in ["shutdown", "shutting_down", "shuttingdown"]:
                         cs_name = cs["name"]
                         stop_url = f"https://api.github.com/user/codespaces/{cs_name}/stop"
                         try:
@@ -424,8 +475,8 @@ def process_account_batch_task(task):
     repo_urls_to_stop = [r["url"] for r in success_repos]
     stop_target_repos_codespaces(acc["github_token"], repo_urls_to_stop, chat_id)
     
-    # ==================== PHASE 3: START CODESPACE MỚI ====================
-    print(f"🚀 PHASE 3: Start codespace mới cho {len(success_repos)} repo...")
+    # ==================== PHASE 3: START CODESPACE CÓ SẴN ====================
+    print(f"🚀 PHASE 3: Start codespace có sẵn cho {len(success_repos)} repo...")
     with ThreadPoolExecutor(max_workers=min(len(success_repos), 2)) as executor:
         futures = []
         for index, repo in enumerate(success_repos):
@@ -460,7 +511,7 @@ def login_only_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
     
     web_url = create_codespace_via_api(acc["github_token"], repo["url"])
     if not web_url:
-        STATUS_TRACKER[repo_name]["status"] = "❌ Phase 1: Lỗi API GitHub (không lấy được URL)"
+        STATUS_TRACKER[repo_name]["status"] = "❌ Phase 1: Không có codespace để start (không tạo mới)"
         STATUS_TRACKER[repo_name]["last_update"] = time.time()
         return False
     
@@ -589,8 +640,9 @@ def login_only_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
                 context.close()
 
 def start_new_codespace_pipeline(acc, repo, chat_id, bot_index=0, otp_lock=None):
-    """PHASE 3: Tạo codespace mới và vào workspace, chờ terminal, mở terminal mới.
-    Sử dụng cookie đã lưu từ Phase 1 (không login lại trừ khi cookie hết hạn)."""
+    """PHASE 3: Start codespace có sẵn (không tạo mới) và vào workspace,
+    chờ terminal, mở terminal mới.
+    Sử dụng cookie đã lưu từ Phase 1."""
     global LOG_NEEDS_REPOST
     repo_name = repo["name"]
     
@@ -600,12 +652,12 @@ def start_new_codespace_pipeline(acc, repo, chat_id, bot_index=0, otp_lock=None)
         STATUS_TRACKER[repo_name]["last_update"] = time.time()
         time.sleep(delay_time)
     
-    STATUS_TRACKER[repo_name]["status"] = "🚀 Phase 3: Đang tạo codespace mới..."
+    STATUS_TRACKER[repo_name]["status"] = "🚀 Phase 3: Đang start codespace có sẵn..."
     STATUS_TRACKER[repo_name]["last_update"] = time.time()
     
     web_url = create_codespace_via_api(acc["github_token"], repo["url"])
     if not web_url:
-        STATUS_TRACKER[repo_name]["status"] = "❌ Phase 3: Lỗi API GitHub"
+        STATUS_TRACKER[repo_name]["status"] = "❌ Phase 3: Không start được codespace (không tạo mới)"
         STATUS_TRACKER[repo_name]["last_update"] = time.time()
         return
     
@@ -769,7 +821,7 @@ def start_new_codespace_pipeline(acc, repo, chat_id, bot_index=0, otp_lock=None)
 # Thay thế bằng:
 #   - login_only_pipeline() — Phase 1: login + lưu cookie.
 #   - stop_target_repos_codespaces() — Phase 2: stop qua API.
-#   - start_new_codespace_pipeline() — Phase 3: start codespace mới.
+#   - start_new_codespace_pipeline() — Phase 3: start codespace có sẵn.
 # Cả 3 hàm được gọi tuần tự trong process_account_batch_task().
 # ====================================================================
 # def run_single_bot_pipeline(acc, repo, chat_id, otp_lock, bot_index=0):
@@ -1444,9 +1496,6 @@ def start_all(message):
             return
     else:
         filtered_accounts = accounts
-    
-    # Đã bỏ Thread(clean_all_active_codespaces) + time.sleep(2) vì Phase 2 của
-    # process_account_batch_task sẽ tự stop codespace với cơ chế poll đúng.
     
     if target_bots:
         bot.send_message(message.chat.id, f"⚡ Đang phân bổ các bot `{', '.join(target_bots).upper()}` vào hàng đợi (login → stop → start)...", parse_mode="Markdown")
